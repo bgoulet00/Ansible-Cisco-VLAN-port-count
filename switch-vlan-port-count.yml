@@ -1,0 +1,158 @@
+---
+# this script will count and report the number of ports that are in a given vlan and how many of them are active
+# output will be place in switch-vlan-<VLANID>-port-count.csv
+
+
+
+
+  # begin play to gather local linux system facts
+- name: gather needed localhost facts
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  
+  #begin play to access cisco devices
+- name: switch vlan ports
+  hosts: all
+  connection: network_cli
+  gather_facts: yes
+  vars:
+    ansible_network_os: cisco.ios.ios
+    vlan_parse_path: ./vlan-parser.yml
+    #define vlan to gather data on
+    vlan: 250
+    outfile: "./DEVICE-OUTPUT/switch-vlan-{{vlan}}-port-count-{{hostvars['localhost'].ansible_date_time.date}}.csv"
+    #list to hold all vlan ports in connected state
+    vlanconnected: []
+
+
+
+
+  
+  tasks:
+
+##########################################################
+# get show vlan data and manipulate it to useful structure data
+##########################################################
+
+
+# Get the standard output of show vlan command and store it in a variable
+  - name: get vlan info
+    ios_command:
+      commands: show vlan
+    register: vlan_output
+
+# run the show vlan output through a parser to convert it to sturctured data
+  - name: generate structured data from vlan output
+    set_fact:
+      ios_vlans: "{{vlan_output.stdout[0] | parse_cli(vlan_parse_path)}}"
+      
+
+# itterate through the structured data, locate the vlan, and copy its contents to a variable
+# original data is a dictionary with key 'vlans' which is a list of vlan dictionaries
+# new variable is a dictionary where key 'ports' is a list of member ports 
+# if the vlan doesn't exist the new dictionary will be undefined
+# if the vlan exists but has no ports assigned the port list will contain a single element with an empty string
+# this is a noisy task so no_log is used to supress terminal output
+  - name: extract vlan {{vlan}} data structure if it exists
+    set_fact: 
+      vlan_ports: "{{item}}"
+    with_items: "{{ios_vlans.vlans}}"
+    when: item.id == vlan
+    no_log: true
+
+
+# check if the ports object is defined and that it has a first element that isn't empty (no ports in the vlan)
+  - name: get number of vlan ports
+    debug:
+      msg: "vlan has {{vlan_ports.ports|length}} ports"
+    when: 
+      - vlan_ports is defined
+      - "{{vlan_ports.ports[0]|length}} > 0"
+      
+##########################################################
+# gather data on ports in connected state
+##########################################################
+      
+# for each port in the vlan, get the connected status.  contents will be registered in a dictionary
+# useful data is in the results key.  register.results.item is port name and register.results.stdout contains the show output
+# use conditions to verify vlan dictionary exists and the ports key is not an empty list
+# register variable is created even if no commands execute but key 'skipped' will equal 'true' 
+# this is a noisy task so no_log is used to supress terminal output
+  - name: get show int data
+    cli_command: 
+      command: "show int {{item}}"
+    with_items: "{{vlan_ports.ports}}"
+    when:
+      - vlan_ports is defined
+      - "{{vlan_ports.ports[0]|length}} > 0"
+    register: vlanportstatus
+    no_log: true
+    
+# creat a new list of only ports that are currently connected
+# this is a noisy task so no_log is used to supress terminal output
+  - name: get connected ports
+    set_fact:
+      vlanconnected: "{{vlanconnected + [item.item]}}"
+    with_items: "{{vlanportstatus.results}}"
+    when: 
+      - vlanportstatus.skipped == false
+      - "'connected' in item.stdout"
+    no_log: true
+  
+
+##########################################################
+# get tally of ports in vlan and how many are connected
+##########################################################
+
+  - name: set port count facts when ports exist
+    set_fact:
+      vlan_count: "{{vlan_ports.ports|length}}"
+    when: 
+      - vlan_ports is defined
+      - "{{vlan_ports.ports[0]|length}} > 0"
+      
+  - name: set port count facts when ports dont exist
+    set_fact:
+      vlan_count: 0
+    when: vlan_ports is not defined or vlan_ports.ports[0]|length == 0
+      
+  - name: set in use count facts when ports exist
+    set_fact:
+      live_count: "{{vlanconnected|length}}"
+    when: 
+      - "{{vlanconnected|length}} > 0"
+
+  - name: set in use port count facts when ports dont exist
+    set_fact:
+      live_count: 0
+    when: 
+      - "{{vlanconnected|length}} == 0"
+
+##########################################################
+# perform output
+##########################################################
+
+  - name: ouput the findings to terminal
+    debug:
+      msg: "switch {{ansible_facts.net_hostname}} has {{vlan_count}} ports in vlan {{vlan}} of which {{live_count}} are connected"
+
+  - name: create directory
+    file:
+      path: "./DEVICE-OUTPUT"
+      state: directory
+    run_once: yes
+      
+  - name: create the output file with CSV column headers
+    copy:
+      content: "Switch,VLAN {{vlan}} Port Count,VLAN {{vlan}} Active Ports"
+      dest: "{{outfile}}"
+    delegate_to: localhost
+    run_once: true
+
+  - name: output port count
+    lineinfile:
+      path: "{{outfile}}"
+      line: "{{ansible_facts.net_hostname}},{{vlan_count}},{{live_count}}"
+
+    
